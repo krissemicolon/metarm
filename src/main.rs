@@ -2,7 +2,7 @@ use clap::{Arg, App, ArgMatches};
 
 fn main() {
     // argparsing & cli
-    let app = App::new("ꟽ ꓤ ꓯ ꓕ ꓱ ꟽ 'metarm'")
+    let app = App::new("ꟽ ꓱ ꓕ ꓯ ꓤ ꟽ 'metarm'")
         .version("v1.0")
         .about("Metadata removal tool")
         .author("Kris Huber <kris@krishuber.xyz>")
