@@ -15,3 +15,13 @@ By default it keeps only the tags that affect how an image is displayed: orienta
 Supports JPEG, PNG/APNG and WebP, detected by content rather than extension. Pixel data is never re-encoded, and files are replaced atomically.
 
 Build with `cargo build --release`. See the man page (`man ./metarm.1`) for all options.
+
+## Install
+
+```sh
+cargo install metarm
+```
+
+## License
+
+MIT
