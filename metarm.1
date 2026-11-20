@@ -1,11 +1,11 @@
-.TH METARM 1 2026-11-20 "metarm 0.1.0"
+.TH METARM 1 2026-11-20 "metarm 0.2.0"
 
 .SH NAME
 metarm \- remove metadata from files
 
 .SH SYNOPSIS
 .B metarm
-[\fB\-rRfav\fR]
+[\fB\-rRfaiv\fR]
 .I file ...
 
 .SH DESCRIPTION
@@ -53,8 +53,23 @@ has no effect; accepted for compatibility with
 remove all metadata, including the orientation, resolution and colour-space
 tags kept by default.
 .TP
+.BR \-i ", " \-\-info
+list the metadata in each file without changing it. Each line shows whether
+stripping would
+.B keep
+or
+.B strip
+the item, taking
+.B \-a
+into account. Unlike
+.BR rm (1),
+.B \-i
+does not mean interactive.
+.TP
 .BR \-v ", " \-\-verbose
-print each file as it is processed.
+print each file as it is processed. With
+.BR \-i ,
+show long values in full instead of shortening them.
 .TP
 .BR \-h ", " \-\-help
 display help.
@@ -89,6 +104,9 @@ strip every supported image under a directory
 .TP
 .B metarm \-a photo.jpg
 strip everything, including orientation
+.TP
+.B metarm \-ri ~/Pictures
+list the metadata of every image under a directory
 
 .SH AUTHOR
 Kris Huber <kris@krishuber.xyz>

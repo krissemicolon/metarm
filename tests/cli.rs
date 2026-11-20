@@ -230,3 +230,67 @@ fn preserves_permissions_and_follows_explicit_symlink() {
     assert_eq!(meta.permissions().mode() & 0o777, 0o640);
     assert!(!contains(&fs::read(d.path("a.jpg")).unwrap(), b"SECRET"));
 }
+
+#[test]
+fn info_lists_metadata_without_modifying() {
+    let d = TempDir::new("info");
+    write(&d.path("a.jpg"), &jpeg());
+    let before = fs::read(d.path("a.jpg")).unwrap();
+
+    let out = run(&d, &["-i", "a.jpg"]);
+    assert!(out.status.success(), "{:?}", out);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.starts_with("a.jpg: JPEG\n"), "{}", text);
+    assert!(
+        text.lines()
+            .any(|l| l.contains("strip") && l.contains("Make") && l.contains("SECRETCAM")),
+        "{}",
+        text
+    );
+    assert!(
+        text.lines()
+            .any(|l| l.contains("keep") && l.contains("Orientation") && l.contains("rotated 90")),
+        "{}",
+        text
+    );
+    assert!(
+        text.lines()
+            .any(|l| l.contains("Comment") && l.contains("SECRET COMMENT")),
+        "{}",
+        text
+    );
+    assert_eq!(
+        fs::read(d.path("a.jpg")).unwrap(),
+        before,
+        "-i must not modify files"
+    );
+}
+
+#[test]
+fn info_with_all_marks_orientation_as_stripped() {
+    let d = TempDir::new("info-all");
+    write(&d.path("a.jpg"), &jpeg());
+    let out = run(&d, &["-ia", "a.jpg"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.lines()
+            .any(|l| l.contains("strip") && l.contains("Orientation")),
+        "{}",
+        text
+    );
+}
+
+#[test]
+fn info_matches_what_stripping_does() {
+    let d = TempDir::new("info-after");
+    write(&d.path("dir/a.jpg"), &jpeg());
+    write(&d.path("dir/b.png"), &png());
+    assert!(run(&d, &["-r", "dir"]).status.success());
+
+    let out = run(&d, &["-ri", "dir"]);
+    assert!(out.status.success(), "{:?}", out);
+    let text = String::from_utf8_lossy(&out.stdout);
+    // After stripping, everything left is something -i says is kept.
+    assert!(!text.contains("strip "), "{}", text);
+    assert!(text.contains("dir/b.png: PNG, no metadata"), "{}", text);
+}

@@ -1,6 +1,10 @@
 //! Format-specific metadata stripping.
 //!
-//! Every stripper takes the full file contents and returns the cleaned bytes.
+//! Each format is first split into its structural parts (JPEG segments,
+//! PNG chunks, RIFF chunks). The keep/drop decision for each part lives in
+//! one function per format, shared by the stripper and by `info`, so what
+//! `metarm -i` reports is exactly what stripping does.
+//!
 //! Format detection is done by magic bytes, never by file extension.
 
 use crate::exif::Kept;
@@ -78,23 +82,27 @@ pub fn strip(format: Format, data: &[u8], mode: Mode) -> Result<Vec<u8>, Malform
 
 // ---------------------------------------------------------------- JPEG ----
 
-/// Keeps only what is needed to decode the image correctly:
-/// - APP0 JFIF header (version + pixel density), with any embedded thumbnail removed
-/// - APP1 EXIF, rebuilt from scratch with only display tags (unless `Mode::All`)
-/// - APP2 only if it is an ICC profile (other APP2 users, e.g. FPXR/MPF, are dropped)
-/// - APP14 "Adobe" (needed to decode CMYK/YCCK colour correctly)
-///
-/// Dropped: the original APP1 (EXIF, XMP), JFXX thumbnails, the remaining APPn segments (IPTC/Photoshop,
-/// maker data, ...), COM comments, and anything trailing after EOI
-/// (thumbnails / vendor trailers).
-fn strip_jpeg(data: &[u8], mode: Mode) -> Result<Vec<u8>, Malformed> {
+pub enum JpegPart<'a> {
+    /// A marker without a length field (RSTn, TEM).
+    Standalone(u8),
+    /// A marker segment; `payload` excludes the 2-byte length field.
+    Segment {
+        marker: u8,
+        payload: &'a [u8],
+    },
+    /// Entropy-coded image data following an SOS segment.
+    Scan(&'a [u8]),
+    Eoi,
+    /// Bytes after EOI (vendor trailers, appended thumbnails/videos, ...).
+    Trailer(&'a [u8]),
+}
+
+pub fn jpeg_parts(data: &[u8]) -> Result<Vec<JpegPart<'_>>, Malformed> {
     if !data.starts_with(&[0xFF, 0xD8]) {
         return Err(Malformed("missing JPEG SOI marker"));
     }
-    let mut out = Vec::with_capacity(data.len());
-    out.extend_from_slice(&[0xFF, 0xD8]);
+    let mut parts = Vec::new();
     let mut pos = 2;
-    let mut exif_done = false;
 
     loop {
         // Find next marker: 0xFF followed by a non-0xFF byte (0xFF fill bytes are allowed).
@@ -112,13 +120,14 @@ fn strip_jpeg(data: &[u8], mode: Mode) -> Result<Vec<u8>, Malformed> {
 
         match marker {
             0xD9 => {
-                // EOI: done; drop any trailing data.
-                out.extend_from_slice(&[0xFF, 0xD9]);
-                return Ok(out);
+                parts.push(JpegPart::Eoi);
+                if pos < data.len() {
+                    parts.push(JpegPart::Trailer(&data[pos..]));
+                }
+                return Ok(parts);
             }
-            // Standalone markers without a length field.
             0x01 | 0xD0..=0xD7 => {
-                out.extend_from_slice(&[0xFF, marker]);
+                parts.push(JpegPart::Standalone(marker));
                 continue;
             }
             _ => {}
@@ -131,52 +140,20 @@ fn strip_jpeg(data: &[u8], mode: Mode) -> Result<Vec<u8>, Malformed> {
         if len < 2 || pos + len > data.len() {
             return Err(Malformed("invalid JPEG segment length"));
         }
-        let payload = &data[pos + 2..pos + len];
-        let segment = &data[pos..pos + len]; // length field + payload
+        parts.push(JpegPart::Segment {
+            marker,
+            payload: &data[pos + 2..pos + len],
+        });
         pos += len;
 
-        if marker == 0xE0 {
-            // JFIF: version(2) units(1) density(4) thumb_w(1) thumb_h(1) thumb...
-            // Re-emit without the thumbnail. JFXX (thumbnail extension) is dropped.
-            if payload.len() >= 14 && payload.starts_with(b"JFIF\0") {
-                out.extend_from_slice(&[0xFF, 0xE0, 0, 16]);
-                out.extend_from_slice(&payload[..12]);
-                out.extend_from_slice(&[0, 0]);
-            }
-            continue;
-        }
-        if marker == 0xE1 && payload.starts_with(b"Exif\0\0") && !exif_done {
-            exif_done = true;
-            if let Some(tiff) = rebuilt_exif(mode, &payload[6..]) {
-                out.extend_from_slice(&[0xFF, 0xE1]);
-                out.extend_from_slice(&((tiff.len() + 8) as u16).to_be_bytes());
-                out.extend_from_slice(b"Exif\0\0");
-                out.extend_from_slice(&tiff);
-            }
-            continue;
-        }
-
-        let keep = match marker {
-            0xE2 => payload.starts_with(b"ICC_PROFILE\0"),
-            0xEE => payload.starts_with(b"Adobe"),
-            0xE1 | 0xE3..=0xED | 0xEF => false,
-            0xFE => false, // COM
-            _ => true,
-        };
-        if keep {
-            // Re-emit with a single 0xFF regardless of fill bytes in the source.
-            out.extend_from_slice(&[0xFF, marker]);
-            out.extend_from_slice(segment);
-        }
-
         if marker == 0xDA {
-            // SOS: copy entropy-coded data until the next real marker.
+            // SOS: entropy-coded data runs until the next real marker.
             let start = pos;
             loop {
                 if pos + 1 >= data.len() {
                     // No EOI; keep what's there (truncated but still decodable by most readers).
-                    out.extend_from_slice(&data[start..]);
-                    return Ok(out);
+                    parts.push(JpegPart::Scan(&data[start..]));
+                    return Ok(parts);
                 }
                 if data[pos] == 0xFF {
                     let next = data[pos + 1];
@@ -187,9 +164,85 @@ fn strip_jpeg(data: &[u8], mode: Mode) -> Result<Vec<u8>, Malformed> {
                 }
                 pos += 1;
             }
-            out.extend_from_slice(&data[start..pos]);
+            parts.push(JpegPart::Scan(&data[start..pos]));
         }
     }
+}
+
+/// What stripping does with a JPEG segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JpegFate {
+    Keep,
+    Drop,
+    /// JFIF header: kept, but any embedded thumbnail is removed.
+    JfifWithoutThumbnail,
+    /// EXIF: the first block is rebuilt with display tags only; later ones are dropped.
+    RebuildExif,
+}
+
+/// Keeps only what is needed to decode the image correctly:
+/// - APP0 JFIF header (version + pixel density), with any embedded thumbnail removed
+/// - APP1 EXIF, rebuilt from scratch with only display tags (unless `Mode::All`)
+/// - APP2 only if it is an ICC profile (other APP2 users, e.g. FPXR/MPF, are dropped)
+/// - APP14 "Adobe" (needed to decode CMYK/YCCK colour correctly)
+///
+/// Dropped: XMP, JFXX thumbnails, the remaining APPn segments (IPTC/Photoshop,
+/// maker data, ...), COM comments, and anything trailing after EOI.
+pub fn jpeg_fate(marker: u8, payload: &[u8]) -> JpegFate {
+    match marker {
+        0xE0 if payload.len() >= 14 && payload.starts_with(b"JFIF\0") => {
+            JpegFate::JfifWithoutThumbnail
+        }
+        0xE1 if payload.starts_with(b"Exif\0\0") => JpegFate::RebuildExif,
+        0xE2 if payload.starts_with(b"ICC_PROFILE\0") => JpegFate::Keep,
+        0xEE if payload.starts_with(b"Adobe") => JpegFate::Keep,
+        0xE0..=0xEF | 0xFE => JpegFate::Drop,
+        _ => JpegFate::Keep,
+    }
+}
+
+fn push_jpeg_segment(out: &mut Vec<u8>, marker: u8, payload: &[u8]) {
+    out.extend_from_slice(&[0xFF, marker]);
+    out.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+    out.extend_from_slice(payload);
+}
+
+fn strip_jpeg(data: &[u8], mode: Mode) -> Result<Vec<u8>, Malformed> {
+    let mut out = Vec::with_capacity(data.len());
+    out.extend_from_slice(&[0xFF, 0xD8]);
+    let mut exif_done = false;
+
+    for part in jpeg_parts(data)? {
+        match part {
+            JpegPart::Standalone(m) => out.extend_from_slice(&[0xFF, m]),
+            JpegPart::Scan(bytes) => out.extend_from_slice(bytes),
+            JpegPart::Eoi => out.extend_from_slice(&[0xFF, 0xD9]),
+            JpegPart::Trailer(_) => {}
+            JpegPart::Segment { marker, payload } => match jpeg_fate(marker, payload) {
+                JpegFate::Keep => push_jpeg_segment(&mut out, marker, payload),
+                JpegFate::Drop => {}
+                JpegFate::JfifWithoutThumbnail => {
+                    // JFIF: version(2) units(1) density(4) thumb_w(1) thumb_h(1) thumb...
+                    let mut jfif = payload[..12].to_vec();
+                    jfif.extend_from_slice(&[0, 0]);
+                    push_jpeg_segment(&mut out, marker, &jfif);
+                }
+                JpegFate::RebuildExif => {
+                    if !exif_done {
+                        exif_done = true;
+                        if let Some(tiff) = rebuilt_exif(mode, &payload[6..]) {
+                            push_jpeg_segment(
+                                &mut out,
+                                marker,
+                                &[b"Exif\0\0".as_ref(), &tiff].concat(),
+                            );
+                        }
+                    }
+                }
+            },
+        }
+    }
+    Ok(out)
 }
 
 // ----------------------------------------------------------------- PNG ----
@@ -205,6 +258,50 @@ const PNG_KEEP_ANCILLARY: &[&[u8; 4]] = &[
     b"cICP", b"mDCV", b"cLLI", // colour / display
     b"acTL", b"fcTL", b"fdAT", // APNG animation
 ];
+
+pub struct PngChunk<'a> {
+    pub ty: [u8; 4],
+    pub data: &'a [u8],
+    /// The whole chunk: length, type, data and CRC.
+    pub raw: &'a [u8],
+}
+
+/// Returns the chunks up to and including IEND, plus any bytes after IEND.
+pub fn png_chunks(data: &[u8]) -> Result<(Vec<PngChunk<'_>>, &[u8]), Malformed> {
+    if !data.starts_with(PNG_SIG) {
+        return Err(Malformed("missing PNG signature"));
+    }
+    let mut chunks = Vec::new();
+    let mut pos = PNG_SIG.len();
+    while pos < data.len() {
+        if pos + 8 > data.len() {
+            return Err(Malformed("truncated PNG chunk header"));
+        }
+        let len =
+            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        let ty: [u8; 4] = [data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]];
+        let end = pos
+            .checked_add(12)
+            .and_then(|v| v.checked_add(len))
+            .filter(|&e| e <= data.len())
+            .ok_or(Malformed("truncated PNG chunk"))?;
+        chunks.push(PngChunk {
+            ty,
+            data: &data[pos + 8..end - 4],
+            raw: &data[pos..end],
+        });
+        pos = end;
+        if &ty == b"IEND" {
+            return Ok((chunks, &data[pos..]));
+        }
+    }
+    Err(Malformed("missing PNG IEND chunk"))
+}
+
+/// Whether stripping keeps a PNG chunk as-is (eXIf is handled separately).
+pub fn png_keeps(ty: &[u8; 4]) -> bool {
+    ty[0].is_ascii_uppercase() || PNG_KEEP_ANCILLARY.contains(&ty)
+}
 
 fn png_crc(bytes: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
@@ -222,29 +319,12 @@ fn png_crc(bytes: &[u8]) -> u32 {
 }
 
 fn strip_png(data: &[u8], mode: Mode) -> Result<Vec<u8>, Malformed> {
-    if !data.starts_with(PNG_SIG) {
-        return Err(Malformed("missing PNG signature"));
-    }
+    let (chunks, _trailer) = png_chunks(data)?;
     let mut out = Vec::with_capacity(data.len());
     out.extend_from_slice(PNG_SIG);
-    let mut pos = PNG_SIG.len();
-
-    while pos < data.len() {
-        if pos + 8 > data.len() {
-            return Err(Malformed("truncated PNG chunk header"));
-        }
-        let len =
-            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-        let ty: [u8; 4] = [data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]];
-        let end = pos
-            .checked_add(12)
-            .and_then(|v| v.checked_add(len))
-            .filter(|&e| e <= data.len())
-            .ok_or(Malformed("truncated PNG chunk"))?;
-
-        let critical = ty[0].is_ascii_uppercase();
-        if &ty == b"eXIf" {
-            if let Some(tiff) = rebuilt_exif(mode, &data[pos + 8..end - 4]) {
+    for c in chunks {
+        if &c.ty == b"eXIf" {
+            if let Some(tiff) = rebuilt_exif(mode, c.data) {
                 let start = out.len();
                 out.extend_from_slice(&(tiff.len() as u32).to_be_bytes());
                 out.extend_from_slice(b"eXIf");
@@ -252,15 +332,11 @@ fn strip_png(data: &[u8], mode: Mode) -> Result<Vec<u8>, Malformed> {
                 let crc = png_crc(&out[start + 4..]);
                 out.extend_from_slice(&crc.to_be_bytes());
             }
-        } else if critical || PNG_KEEP_ANCILLARY.iter().any(|k| **k == ty) {
-            out.extend_from_slice(&data[pos..end]);
-        }
-        pos = end;
-        if &ty == b"IEND" {
-            return Ok(out); // drop anything trailing after IEND
+        } else if png_keeps(&c.ty) {
+            out.extend_from_slice(c.raw);
         }
     }
-    Err(Malformed("missing PNG IEND chunk"))
+    Ok(out)
 }
 
 // ---------------------------------------------------------------- WebP ----
@@ -271,7 +347,15 @@ const WEBP_KEEP: &[&[u8; 4]] = &[
 const VP8X_FLAG_EXIF: u8 = 0x08;
 const VP8X_FLAG_XMP: u8 = 0x04;
 
-fn strip_webp(data: &[u8], mode: Mode) -> Result<Vec<u8>, Malformed> {
+pub struct RiffChunk<'a> {
+    pub ty: [u8; 4],
+    pub data: &'a [u8],
+    /// The whole chunk: type, size, data and padding byte.
+    pub raw: &'a [u8],
+}
+
+/// Returns the chunks inside the RIFF container, plus any bytes after it.
+pub fn webp_chunks(data: &[u8]) -> Result<(Vec<RiffChunk<'_>>, &[u8]), Malformed> {
     if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WEBP" {
         return Err(Malformed("missing RIFF/WEBP header"));
     }
@@ -281,11 +365,8 @@ fn strip_webp(data: &[u8], mode: Mode) -> Result<Vec<u8>, Malformed> {
         .filter(|&e| e <= data.len())
         .ok_or(Malformed("RIFF size exceeds file size"))?;
 
-    let mut body = Vec::with_capacity(riff_len);
-    body.extend_from_slice(b"WEBP");
+    let mut chunks = Vec::new();
     let mut pos = 12;
-    let mut vp8x_flags_at = None;
-    let mut wrote_exif = false;
     while pos < riff_end {
         if pos + 8 > riff_end {
             return Err(Malformed("truncated WebP chunk header"));
@@ -293,30 +374,53 @@ fn strip_webp(data: &[u8], mode: Mode) -> Result<Vec<u8>, Malformed> {
         let ty: [u8; 4] = [data[pos], data[pos + 1], data[pos + 2], data[pos + 3]];
         let len = u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
             as usize;
-        let padded = len + (len & 1);
         let end = pos
-            .checked_add(8 + padded)
+            .checked_add(8 + len + (len & 1))
             .filter(|&e| e <= riff_end)
             .ok_or(Malformed("truncated WebP chunk"))?;
+        chunks.push(RiffChunk {
+            ty,
+            data: &data[pos + 8..pos + 8 + len],
+            raw: &data[pos..end],
+        });
+        pos = end;
+    }
+    Ok((chunks, &data[riff_end..]))
+}
 
-        if &ty == b"EXIF" && !wrote_exif {
-            if let Some(tiff) = rebuilt_exif(mode, &data[pos + 8..pos + 8 + len]) {
-                wrote_exif = true;
-                body.extend_from_slice(b"EXIF");
-                body.extend_from_slice(&(tiff.len() as u32).to_le_bytes());
-                body.extend_from_slice(&tiff);
-                if tiff.len() % 2 == 1 {
-                    body.push(0);
+/// Whether stripping keeps a WebP chunk as-is (EXIF is handled separately).
+pub fn webp_keeps(ty: &[u8; 4]) -> bool {
+    WEBP_KEEP.contains(&ty)
+}
+
+fn strip_webp(data: &[u8], mode: Mode) -> Result<Vec<u8>, Malformed> {
+    let (chunks, _trailer) = webp_chunks(data)?;
+    let mut body = Vec::with_capacity(data.len());
+    body.extend_from_slice(b"WEBP");
+    let mut vp8x_flags_at = None;
+    let mut exif_done = false;
+    let mut wrote_exif = false;
+
+    for c in chunks {
+        if &c.ty == b"EXIF" {
+            if !exif_done {
+                exif_done = true;
+                if let Some(tiff) = rebuilt_exif(mode, c.data) {
+                    wrote_exif = true;
+                    body.extend_from_slice(b"EXIF");
+                    body.extend_from_slice(&(tiff.len() as u32).to_le_bytes());
+                    body.extend_from_slice(&tiff);
+                    if tiff.len() % 2 == 1 {
+                        body.push(0);
+                    }
                 }
             }
-        } else if WEBP_KEEP.iter().any(|k| **k == ty) {
-            let start = body.len();
-            body.extend_from_slice(&data[pos..end]);
-            if &ty == b"VP8X" && len >= 1 {
-                vp8x_flags_at = Some(start + 8);
+        } else if webp_keeps(&c.ty) {
+            if &c.ty == b"VP8X" && !c.data.is_empty() {
+                vp8x_flags_at = Some(body.len() + 8);
             }
+            body.extend_from_slice(c.raw);
         }
-        pos = end;
     }
     match vp8x_flags_at {
         Some(at) => {
