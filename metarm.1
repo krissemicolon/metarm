@@ -1,35 +1,97 @@
-.TH METARM 1 2021-09-19 GNU
+.TH METARM 1 2026-11-20 "metarm 0.1.0"
 
 .SH NAME
-metarm \- meta remove
+metarm \- remove metadata from files
 
 .SH SYNOPSIS
 .B metarm
-[\fB\-h\fR]
-[\fB\-v\fR]
-[\fB\-f\fR \fIfile\fR]
+[\fB\-rRfav\fR]
+.I file ...
 
 .SH DESCRIPTION
 .B metarm
-metadata removal tool
+strips metadata (EXIF, GPS location, XMP, IPTC, comments, text chunks,
+timestamps) from each given
+.IR file ,
+rewriting it in place. It is invoked like
+.BR rm (1):
+directories require
+.BR \-r ,
+and
+.B \-f
+is accepted so that muscle memory such as
+.B metarm \-rf dir
+works.
+.PP
+By default a handful of tags that only affect how the image is displayed are
+kept, so photos still appear the right way up: orientation, resolution
+(X/Y resolution and unit) and colour space. They are copied into a newly
+built EXIF block, never passed through, so nothing else from the original
+EXIF survives. Use
+.B \-a
+to remove those as well.
+.PP
+Image data is never re-encoded. Only the metadata segments are dropped;
+colour information needed to display the image correctly (ICC profiles,
+gamma, transparency) is kept. Files are replaced atomically and keep their
+permissions.
+.PP
+Formats are detected by content, not by file extension. Supported formats:
+JPEG, PNG (including APNG), WebP.
 
 .SH OPTIONS
 .TP
+.BR \-r ", " \-R ", " \-\-recursive
+process directories recursively. Unsupported files inside directories are
+skipped silently, and symbolic links are not followed.
+.TP
+.BR \-f ", " \-\-force
+has no effect; accepted for compatibility with
+.BR rm (1).
+.TP
+.BR \-a ", " \-\-all
+remove all metadata, including the orientation, resolution and colour-space
+tags kept by default.
+.TP
+.BR \-v ", " \-\-verbose
+print each file as it is processed.
+.TP
 .BR \-h ", " \-\-help
-displays help page
+display help.
 .TP
-.BR \-v ", " \-\-version
-prints version information
-.TP
-.BR \-f ", " \-\-file " " \fIfile
-file you want to remove metadata from
+.BR \-V ", " \-\-version
+print version information.
 
-.SH FILES
+.SH EXIT STATUS
+0 if every named file was processed successfully, 1 otherwise. A file named
+directly on the command line that is not a supported format is an error.
+
+.SH NOTES
+With
+.BR \-a ,
+photos that relied on the orientation tag may display rotated.
+.PP
+ICC colour profiles are kept even with
+.BR \-a ,
+since removing them changes how colours are displayed.
+.PP
+Only metadata embedded in the file is removed. The file name, timestamps and
+extended attributes are left unchanged, and nothing can be done about
+identifying features in the pixels themselves.
+
+.SH EXAMPLES
 .TP
-.I /proc/metarm
+.B metarm photo.jpg
+strip one file
+.TP
+.B metarm \-rf ~/Pictures/upload
+strip every supported image under a directory
+.TP
+.B metarm \-a photo.jpg
+strip everything, including orientation
 
 .SH AUTHOR
 Kris Huber <kris@krishuber.xyz>
 
 .SH SEE ALSO
-\fBrustc\fR(1)
+\fBrm\fR(1)
