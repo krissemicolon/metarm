@@ -1,7 +1,7 @@
 mod exif;
 mod strip;
 
-use clap::{App, AppSettings, Arg};
+use clap::Parser;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -20,48 +20,41 @@ enum Outcome {
     Unsupported,
 }
 
-fn main() {
-    let matches = App::new("metarm")
-        .version(env!("CARGO_PKG_VERSION"))
-        .about("Remove metadata from files, invoked like rm")
-        .author("Kris Huber <kris@krishuber.xyz>")
-        .setting(AppSettings::ArgRequiredElseHelp)
-        .arg(
-            Arg::with_name("recursive")
-                .short("r")
-                .long("recursive")
-                .help(
-                "Strip metadata from every supported file in the given directories, recursively",
-            ),
-        )
-        .arg(Arg::with_name("recursive_upper").short("R").hidden(true))
-        .arg(
-            Arg::with_name("force")
-                .short("f")
-                .long("force")
-                .help("Accepted for rm compatibility; has no effect"),
-        )
-        .arg(Arg::with_name("all").short("a").long("all").help(
-            "Also remove orientation, resolution and colour-space tags (by default these are kept)",
-        ))
-        .arg(
-            Arg::with_name("verbose")
-                .short("v")
-                .long("verbose")
-                .help("Print each file as it is processed"),
-        )
-        .arg(
-            Arg::with_name("FILE")
-                .multiple(true)
-                .required(true)
-                .help("Files (or directories with -r) to strip metadata from"),
-        )
-        .get_matches();
+/// Strip metadata from images, invoked like rm.
+///
+/// Keeps orientation, resolution and colour space by default so photos still
+/// display correctly; pass -a to remove those as well.
+#[derive(Parser)]
+#[command(name = "metarm", version, author, arg_required_else_help = true)]
+struct Cli {
+    /// Process directories recursively
+    #[arg(short = 'r', long, short_alias = 'R')]
+    recursive: bool,
 
+    /// Accepted for rm compatibility; has no effect
+    #[arg(short = 'f', long)]
+    force: bool,
+
+    /// Also remove orientation, resolution and colour-space tags
+    #[arg(short = 'a', long)]
+    all: bool,
+
+    /// Print each file as it is processed
+    #[arg(short = 'v', long)]
+    verbose: bool,
+
+    /// Files to strip (directories require -r)
+    #[arg(value_name = "FILE", required = true)]
+    files: Vec<PathBuf>,
+}
+
+fn main() {
+    let cli = Cli::parse();
+    let _ = cli.force;
     let opts = Opts {
-        recursive: matches.is_present("recursive") || matches.is_present("recursive_upper"),
-        verbose: matches.is_present("verbose"),
-        mode: if matches.is_present("all") {
+        recursive: cli.recursive,
+        verbose: cli.verbose,
+        mode: if cli.all {
             strip::Mode::All
         } else {
             strip::Mode::KeepDisplay
@@ -69,8 +62,8 @@ fn main() {
     };
 
     let mut ok = true;
-    for arg in matches.values_of_os("FILE").unwrap() {
-        ok &= process_arg(Path::new(arg), &opts);
+    for path in &cli.files {
+        ok &= process_arg(path, &opts);
     }
     process::exit(if ok { 0 } else { 1 });
 }

@@ -1,26 +1,41 @@
 # metarm
-> a metadata removal tool
+> rm for metadata
 
-Removes metadata (EXIF, GPS, XMP, IPTC, comments, text chunks) from images, invoked like `rm`:
-
-```sh
-metarm photo.jpg            # strip one file
-metarm a.jpg b.png c.webp   # several files
-metarm -rf ~/Pictures/out   # every supported file in a directory, recursively
-metarm -a photo.jpg         # remove everything, including orientation
-```
-
-By default it keeps only the tags that affect how an image is displayed: orientation (so photos stay upright), resolution and colour space. They go into a freshly built EXIF block, so nothing else survives. Pass `-a` to drop those too.
-
-Supports JPEG, PNG/APNG and WebP, detected by content rather than extension. Pixel data is never re-encoded, and files are replaced atomically.
-
-Build with `cargo build --release`. See the man page (`man ./metarm.1`) for all options.
-
-## Install
+`metarm` strips identifying metadata (camera make, model and serial number, GPS location, dates, XMP, comments) from images. You use it just like `rm`.
 
 ```sh
 cargo install metarm
 ```
+
+## Usage
+
+```sh
+metarm photo.jpg            # strip one file
+metarm a.jpg b.png c.webp   # several files
+metarm -rf ~/Pictures/out   # every image in a folder, recursively
+metarm -a photo.jpg         # remove everything, including orientation
+```
+
+| Flag | Meaning |
+| --- | --- |
+| `-r`, `-R`, `--recursive` | Process directories recursively. Non-image files inside are skipped. |
+| `-f`, `--force` | Does nothing. Accepted so `metarm -rf` works like `rm -rf`. |
+| `-a`, `--all` | Also remove orientation, resolution and colour space (kept by default). |
+| `-v`, `--verbose` | Print each file as it is processed. |
+| `-h`, `--help` | Show help. |
+| `-V`, `--version` | Show the version. |
+
+## What it does
+
+- Supports **JPEG, PNG (including animated) and WebP**, detected by content rather than file extension.
+- Edits files in place without re-encoding, so image quality is unchanged.
+- By default, keeps the tags that only affect display (orientation, resolution, colour space) so photos stay upright. Pass `-a` to drop them too.
+- Keeps colour profiles so colours look the same.
+- Replaces files atomically and keeps their permissions.
+
+Not covered yet: HEIC, TIFF, RAW, PDF and video files, as well as file names, timestamps and extended attributes.
+
+See `man ./metarm.1` for details.
 
 ## License
 
