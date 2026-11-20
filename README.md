@@ -14,6 +14,23 @@ metarm photo.jpg            # strip one file
 metarm a.jpg b.png c.webp   # several files
 metarm -rf ~/Pictures/out   # every image in a folder, recursively
 metarm -a photo.jpg         # remove everything, including orientation
+metarm -i photo.jpg         # list the metadata, change nothing
+```
+
+`-i` shows each piece of metadata and whether stripping would keep or remove it:
+
+```
+$ metarm -i photo.jpg
+photo.jpg: JPEG
+  strip  EXIF     Make              Apple
+  strip  EXIF     Model             iPhone 15 Pro
+  keep   EXIF     Orientation       6 (rotated 90° CW)
+  strip  EXIF     DateTimeOriginal  2024:06:01 18:22:10
+  strip  EXIF     BodySerialNumber  F2LXK1234
+  strip  GPS      Position          47.370094, 8.541806
+  strip  XMP      dc:creator        Jane Doe
+  strip  Comment  Comment           shot at grandma's house
+  keep   ICC      Profile           sRGB built-in
 ```
 
 | Flag | Meaning |
@@ -21,7 +38,8 @@ metarm -a photo.jpg         # remove everything, including orientation
 | `-r`, `-R`, `--recursive` | Process directories recursively. Non-image files inside are skipped. |
 | `-f`, `--force` | Does nothing. Accepted so `metarm -rf` works like `rm -rf`. |
 | `-a`, `--all` | Also remove orientation, resolution and colour space (kept by default). |
-| `-v`, `--verbose` | Print each file as it is processed. |
+| `-i`, `--info` | List the metadata in each file and what would be stripped, without changing anything. Combine with `-a` to preview `-a`. |
+| `-v`, `--verbose` | Print each file as it is processed. With `-i`, show long values in full. |
 | `-h`, `--help` | Show help. |
 | `-V`, `--version` | Show the version. |
 

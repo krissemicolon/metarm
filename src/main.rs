@@ -1,4 +1,5 @@
 mod exif;
+mod info;
 mod strip;
 
 use clap::Parser;
@@ -6,10 +7,12 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 struct Opts {
     recursive: bool,
     verbose: bool,
+    info: bool,
     mode: strip::Mode,
 }
 
@@ -18,6 +21,7 @@ enum Outcome {
     Stripped,
     Clean,
     Unsupported,
+    Listed,
 }
 
 /// Strip metadata from images, invoked like rm.
@@ -39,7 +43,11 @@ struct Cli {
     #[arg(short = 'a', long)]
     all: bool,
 
-    /// Print each file as it is processed
+    /// List the metadata in each file (and what would be stripped) without changing anything
+    #[arg(short = 'i', long)]
+    info: bool,
+
+    /// Print each file as it is processed; with -i, show values in full
     #[arg(short = 'v', long)]
     verbose: bool,
 
@@ -54,6 +62,7 @@ fn main() {
     let opts = Opts {
         recursive: cli.recursive,
         verbose: cli.verbose,
+        info: cli.info,
         mode: if cli.all {
             strip::Mode::All
         } else {
@@ -107,7 +116,7 @@ fn process_arg(path: &Path, opts: &Opts) -> bool {
             return false;
         }
     };
-    match process_file(&target, &meta, opts) {
+    match process_file(&target, path, &meta, opts) {
         Ok(Outcome::Unsupported) => {
             report_err(path, "unsupported file format");
             false
@@ -157,7 +166,7 @@ fn walk(dir: &Path, opts: &Opts) -> bool {
         if ft.is_dir() {
             ok &= walk(&path, opts);
         } else if ft.is_file() {
-            match process_file(&path, &meta, opts) {
+            match process_file(&path, &path, &meta, opts) {
                 Ok(outcome) => log(&path, &outcome, opts),
                 Err(e) => {
                     report_err(&path, e);
@@ -175,6 +184,7 @@ fn log(path: &Path, outcome: &Outcome, opts: &Opts) {
         return;
     }
     let what = match outcome {
+        Outcome::Listed => return,
         Outcome::Stripped => "stripped",
         Outcome::Clean => "no metadata",
         Outcome::Unsupported => "skipped (unsupported format)",
@@ -182,12 +192,25 @@ fn log(path: &Path, outcome: &Outcome, opts: &Opts) {
     println!("{}: '{}'", what, path.display());
 }
 
-fn process_file(path: &Path, meta: &fs::Metadata, opts: &Opts) -> Result<Outcome, String> {
+/// `path` is the file to read and write; `shown` is how to refer to it in output
+/// (they differ when the user named a symlink).
+fn process_file(
+    path: &Path,
+    shown: &Path,
+    meta: &fs::Metadata,
+    opts: &Opts,
+) -> Result<Outcome, String> {
     let data = fs::read(path).map_err(|e| io_msg(&e))?;
     let format = match strip::detect(&data) {
         Some(f) => f,
         None => return Ok(Outcome::Unsupported),
     };
+    if opts.info {
+        let items =
+            info::inspect(format, &data, opts.mode).map_err(|e| format!("{} ({})", e, format))?;
+        print_info(shown, format, &items, opts.verbose);
+        return Ok(Outcome::Listed);
+    }
     let cleaned =
         strip::strip(format, &data, opts.mode).map_err(|e| format!("{} ({})", e, format))?;
     if cleaned == data {
@@ -195,6 +218,53 @@ fn process_file(path: &Path, meta: &fs::Metadata, opts: &Opts) -> Result<Outcome
     }
     write_atomic(path, &cleaned, meta).map_err(|e| io_msg(&e))?;
     Ok(Outcome::Stripped)
+}
+
+fn print_info(path: &Path, format: strip::Format, items: &[info::Item], full: bool) {
+    static PRINTED: AtomicBool = AtomicBool::new(false);
+    if PRINTED.swap(true, Ordering::Relaxed) {
+        println!();
+    }
+    if items.is_empty() {
+        println!("{}: {}, no metadata", path.display(), format);
+        return;
+    }
+    println!("{}: {}", path.display(), format);
+    let gw = items
+        .iter()
+        .map(|i| i.group.chars().count())
+        .max()
+        .unwrap_or(0);
+    let nw = items
+        .iter()
+        .map(|i| i.name.chars().count())
+        .max()
+        .unwrap_or(0);
+    for i in items {
+        println!(
+            "  {:<5}  {:<gw$}  {:<nw$}  {}",
+            if i.kept { "keep" } else { "strip" },
+            i.group,
+            i.name,
+            display_value(&i.value, full),
+        );
+    }
+}
+
+/// Makes a value safe to print on one line, shortening it unless `full`.
+fn display_value(v: &str, full: bool) -> String {
+    const MAX: usize = 70;
+    let clean: String = v
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let clean = clean.split_whitespace().collect::<Vec<_>>().join(" ");
+    if full || clean.chars().count() <= MAX {
+        clean
+    } else {
+        let short: String = clean.chars().take(MAX - 1).collect();
+        format!("{}\u{2026}", short)
+    }
 }
 
 /// Writes to a temporary file next to `path`, then renames it over the original,
